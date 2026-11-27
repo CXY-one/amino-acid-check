@@ -3,6 +3,8 @@
 import json
 from pathlib import Path
 
+import numpy as np
+
 from PySide6.QtCore import Qt, QUrl
 from PySide6.QtGui import QImage, QPixmap
 from PySide6.QtWebEngineCore import QWebEngineSettings
@@ -22,7 +24,7 @@ LINK_TYPES = {CARBOXYLATE: "carboxylate", H_BOND: "hydrogen", METAL: "metal", WA
 ATOM_MARK_RADIUS = 5.0
 
 
-def build_scene(pdb: Path, evidence: dict, state: str | None) -> dict:
+def build_scene(pdb: Path, evidence: dict, state: str | None, *, snapshot: bool = False) -> dict:
     structure = Structure(pdb)
     target = structure.residues[ResidueID(evidence["chain"], evidence["residue_number"], evidence["insertion_code"])]
     ids = {atom.label: atom for atom in structure.atoms}
@@ -54,7 +56,7 @@ def build_scene(pdb: Path, evidence: dict, state: str | None) -> dict:
                            for atom, _ in structure.nearest(center.position, ATOM_MARK_RADIUS)
                            if atom.element != "C" and atom not in centers})
     pdb_text = pdb.read_text(encoding="utf-8", errors="replace")
-    return {
+    scene = {
         "site": str(pdb.parent.resolve()),
         "pdb": pdb_text,
         "bonds": display_bonds(structure, pdb_text),
@@ -70,6 +72,51 @@ def build_scene(pdb: Path, evidence: dict, state: str | None) -> dict:
         "center": center.tolist(),
         "axes": axes.tolist(),
     }
+    if snapshot:
+        scene["snapshotView"] = snapshot_view(structure, scene)
+    return scene
+
+
+def snapshot_view(structure: Structure, scene: dict) -> dict:
+    """Choose a modest tilt that separates key atoms and keeps contacts readable."""
+    serial = {atom.pdb.serial: atom.position for atom in structure.atoms}
+    focus = set(scene["focusAtoms"] or scene["target"]) | set(scene["hydrogens"])
+    proximal_metals = scene["metals"].keys() & (focus | set(scene["nearbyAtoms"]))
+    links = scene["links"] + [link for link in scene["coordination"] if link["from"] in proximal_metals]
+    pairs = [(link["from"], link["to"]) for link in links]
+    framed = sorted(focus | proximal_metals | {endpoint for pair in pairs for endpoint in pair})
+    landmarks = sorted(set(scene["labels"]) | {endpoint for pair in pairs for endpoint in pair}) or framed
+    centered = np.array(scene["center"])
+    points = np.array([serial[key] - centered for key in landmarks])
+    # A nearer stick can obscure a landmark even if the atoms are far apart in 3D.
+    context = np.array([atom.position - centered for atom in structure.heavy_atoms])
+    relative = context[None, :, :] - points[:, None, :]
+    separated = np.linalg.norm(relative, axis=2) > 0.6
+    directions = np.array([serial[first] - serial[second] for first, second in pairs]).reshape(-1, 3)
+    directions /= np.maximum(np.linalg.norm(directions, axis=1, keepdims=True), 1e-6)
+    horizontal, vertical = np.array(scene["axes"])
+    normal = np.cross(horizontal, vertical)
+    best_score = -np.inf
+    for yaw in np.deg2rad((0, 15, -15, 30, -30, 45, -45)):
+        x = np.cos(yaw) * horizontal + np.sin(yaw) * normal
+        tilted_normal = np.cross(x, vertical)
+        for pitch in np.deg2rad((0, 15, -15, 30, -30)):
+            y = np.cos(pitch) * vertical + np.sin(pitch) * tilted_normal
+            axes = np.stack((x, y))
+            screen = relative @ axes.T
+            occludes = (relative @ np.cross(x, y) > 0.25) & separated
+            overlaps = np.exp(-np.sum(screen**2, axis=2) / 0.20) * occludes
+            occlusion = overlaps.max(axis=1).mean() if overlaps.size else 0.0
+            length = np.linalg.norm(directions @ axes.T, axis=1)
+            readability = length.mean() if length.size else 0.0
+            score = readability - occlusion - 0.22 * (abs(yaw) + abs(pitch))
+            if score > best_score:
+                best_score, best_axes = score, axes
+    # Center the projected group and evidence together instead of cropping links on one side.
+    key_points = np.array([serial[key] for key in framed])
+    projected = (key_points - centered) @ best_axes.T
+    midpoint = (projected.min(axis=0) + projected.max(axis=0)) / 2
+    return {"axes": best_axes.tolist(), "center": (centered + midpoint @ best_axes).tolist(), "serials": framed}
 
 
 class StructureView(QStackedWidget):

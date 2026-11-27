@@ -101,7 +101,25 @@ class SiteResidue:
                 "target_altloc": self.altloc, "target_altloc_options": list(self.options)}
 
 
+def normalize_metal_ion(residue: gemmi.Residue) -> None:
+    # One named atom, potentially repeated across alternate conformations.
+    if residue.het_flag != "H" or len({atom.name for atom in residue}) != 1:
+        return
+    symbol = residue.name.upper().rstrip("0123456789+-")
+    element = gemmi.Element(symbol)
+    if not element.is_metal or element.name.upper() != symbol:
+        return
+    if residue[0].name.upper().rstrip("0123456789+-") != symbol:
+        return
+    for atom in residue:
+        parsed = atom.element.name.upper()
+        # A shifted element field can leave just the first or last letter.
+        if parsed == "X" or (len(parsed) == 1 and parsed in symbol):
+            atom.element = element
+
+
 def select_residue(chain: str, residue: gemmi.Residue) -> SiteResidue:
+    normalize_metal_ion(residue)
     occupancies = defaultdict(list)
     for atom in residue:
         if altloc := clean_char(atom.altloc):
@@ -139,15 +157,25 @@ class Structure:
         self.model_number = model.num
         self.model_count = len(self.pdb)
         self.residues = {}
+        self.residues_by_name: dict[tuple[ResidueID, str], SiteResidue] = {}
         for chain in model:
             for residue in chain:
                 selected = select_residue(chain.name.strip(), residue)
-                if selected.id in self.residues:
+                key = (selected.id, selected.name)
+                primary = self.residues.get(selected.id)
+                # Deposited waters and cofactors can share a PDB number with a differently named residue.
+                # Target sites must still have an unambiguous chain, number and insertion code.
+                is_target = selected.kind in RESIDUE_TYPES
+                same_polymer_number = primary and primary.pdb.het_flag == selected.pdb.het_flag == "A"
+                ambiguous_target = primary and is_target and primary.kind in RESIDUE_TYPES
+                if key in self.residues_by_name or same_polymer_number or ambiguous_target:
                     raise ValueError(tr("error.duplicate_residue", site=selected.id.label))
-                self.residues[selected.id] = selected
-        if not self.residues:
+                self.residues_by_name[key] = selected
+                if primary is None or is_target:
+                    self.residues[selected.id] = selected
+        if not self.residues_by_name:
             raise ValueError(tr("error.empty_model", model=self.model_number))
-        self.atoms = [atom for residue in self.residues.values() for atom in residue.atoms.values()]
+        self.atoms = [atom for residue in self.residues_by_name.values() for atom in residue.atoms.values()]
         self.positions = np.asarray([atom.position for atom in self.atoms])
         self.heavy_atoms = [atom for atom in self.atoms if not atom.pdb.is_hydrogen()]
         self.heavy_positions = np.asarray([atom.position for atom in self.heavy_atoms]).reshape(-1, 3)
@@ -178,8 +206,9 @@ class Structure:
 
     def resolve(self, address: gemmi.AtomAddress) -> SiteAtom | None:
         key = ResidueID(address.chain_name.strip(), address.res_id.seqid.num, clean_char(address.res_id.seqid.icode))
-        residue = self.residues.get(key)
-        if residue is None or (address.res_id.name and residue.name != address.res_id.name):
+        name = address.res_id.name
+        residue = self.residues_by_name.get((key, name)) if name else self.residues.get(key)
+        if residue is None:
             return None
         atom = residue.atoms.get(address.atom_name)
         altloc = clean_char(address.altloc)
@@ -195,10 +224,10 @@ class Structure:
         centers = target.functional_atoms
         if not centers:
             centers = [target.atoms["CA"]] if "CA" in target.atoms else list(target.atoms.values())
-        keys = {target.id}
+        neighbors = {target}
         for center in centers:
-            keys.update(atom.residue.id for atom, _ in self.nearest(center.position, radius))
-        return [residue for key, residue in self.residues.items() if key in keys]
+            neighbors.update(atom.residue for atom, _ in self.nearest(center.position, radius))
+        return [residue for residue in self.residues_by_name.values() if residue in neighbors]
 
 
 def attached_hydrogens(atom: SiteAtom) -> list[SiteAtom]:

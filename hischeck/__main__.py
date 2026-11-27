@@ -19,6 +19,7 @@ from .structure import RESIDUE_TYPES, SiteResidue, Structure, export_pdb
 
 DEFAULTS = Settings()
 DEFAULT_OUTPUT_RADIUS = 6.0
+PROGRESS_PREFIX = "hischeck-progress "
 
 
 def write_json(path: Path, data: dict) -> None:
@@ -46,7 +47,13 @@ def export_histidine(source: Structure, neighbors: list[SiteResidue], target: Si
     return evidence
 
 
+def report_progress(args: argparse.Namespace, phase: str, completed: int = 0, total: int = 0) -> None:
+    if getattr(args, "progress_json", False):
+        print(PROGRESS_PREFIX + json.dumps({"phase": phase, "completed": completed, "total": total}), flush=True)
+
+
 def analyze_file(args: argparse.Namespace) -> tuple[Path, Counter]:
+    report_progress(args, "reading")
     source_path = args.pdb.resolve()
     output = args.output.resolve()
     if output.exists():
@@ -82,15 +89,19 @@ def analyze_file(args: argparse.Namespace) -> tuple[Path, Counter]:
         fields += ("automatic_states",)
     if with_propka:
         fields += ("propka_pka",)
-        pkas, propka_info = (estimate_pkas(source) if any(site.kind in TITRATABLE for site in sites)
-                             else ({}, {"status": "no_titratable_targets"}))
+        if any(site.kind in TITRATABLE for site in sites):
+            report_progress(args, "propka")
+            pkas, propka_info = estimate_pkas(source)
+        else:
+            pkas, propka_info = {}, {"status": "no_titratable_targets"}
         propka_info["estimated_targets"] = sum(site.id in pkas for site in sites)
     summary = []
     output.parent.mkdir(parents=True, exist_ok=True)
     with TemporaryDirectory(prefix=".hischeck-", dir=output.parent) as temp:
         staged_output = Path(temp) / "results"
         staged_output.mkdir()
-        for target in sites:
+        report_progress(args, "sites", total=len(sites))
+        for completed, target in enumerate(sites, start=1):
             neighbors = source.neighborhood(target, args.radius)
             folder = staged_output / target.id.directory_name(target.kind)
             folder.mkdir()
@@ -116,6 +127,8 @@ def analyze_file(args: argparse.Namespace) -> tuple[Path, Counter]:
             if all_states:
                 row["automatic_states"] = ";".join(evidence.get("automatic_states", []))
             summary.append(row)
+            report_progress(args, "sites", completed, len(sites))
+        report_progress(args, "saving")
         counts = Counter(row["status"] for row in summary)
         with (staged_output / "summary.csv").open("w", encoding="utf-8-sig", newline="") as file:
             writer = csv.DictWriter(file, fieldnames=fields)
@@ -160,6 +173,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--carboxylate-max", type=float, default=DEFAULTS.carboxylate_max,
                         help=tr("cli.carboxylate_max"))
     parser.add_argument("--render", action="store_true", help=tr("cli.render"))
+    parser.add_argument("--progress-json", action="store_true", help=tr("cli.progress_json"))
     parser.add_argument("--all-states", action="store_true",
                         help=tr("cli.all_states"))
     parser.add_argument("--propka", action="store_true", help=tr("cli.propka"))

@@ -10,7 +10,7 @@ import unittest
 from PIL import Image, ImageColor
 import gemmi
 
-from hischeck.__main__ import main
+from hischeck.__main__ import PROGRESS_PREFIX, main
 from hischeck.analysis import H_NAMES
 from hischeck.compare import manual_labels
 from hischeck.preview import CARBOXYLATE
@@ -244,6 +244,76 @@ class HischeckTest(unittest.TestCase):
         self.assertEqual(data["status"], "unresolved")
         self.assertIn("both_nitrogens_coordinate", data["reasons"])
         self.assertTrue((folder / "site_input.pdb").exists())
+
+    def test_shifted_zinc_field_reaches_coordination_and_export(self):
+        self.fixture([("NE2", "metal")])
+        lines = self.input.read_text(encoding="ascii").splitlines()
+        lines[-2] = lines[-2][:75] + "ZN  "
+        raw = "\n".join(lines) + "\n"
+        self.input.write_text(raw, encoding="ascii")
+        self.assertEqual(gemmi.read_pdb_string(raw)[0]["B"][0][0].element.name, "N")
+
+        data, folder = self.run_cli()
+        self.assertEqual(data["recommendation"], "HID")
+        contact, = data["metal_contacts"]
+        self.assertEqual((contact["element"], contact["nitrogen"], contact["confirmed"]), ("ZN", "NE2", True))
+        output = gemmi.read_pdb(str(folder / "site.pdb"))
+        self.assertEqual(output[0]["B"][0][0].element.name, "Zn")
+        self.assertEqual(self.input.read_text(encoding="ascii"), raw)
+
+    def test_monatomic_metal_recovery_is_element_based_and_conservative(self):
+        sites = [
+            ("NI", "NI", "NI", True, "Ni"),  # already correct
+            ("MG", "MG", "G", True, "Mg"),
+            ("CA", "CA", "C", True, "Ca"),
+            ("FE", "FE3", "F", True, "Fe"),
+            ("W", "W", "X", True, "W"),
+            ("MO", "MO", "O", True, "Mo"),
+            ("RH", "RH", "H", True, "Rh"),
+            ("OS", "OS", "S", True, "Os"),
+            ("CA", "ALA", "C", False, "C"),
+            ("CD", "LIG", "C", True, "C"),
+            ("ZN", "ZN", "O", True, "O"),  # conflicting explicit element
+        ]
+        lines = [atom_line(i, name, residue, "A", i, (i * 4, 0, 0), field, het=het)
+                 for i, (name, residue, field, het, _) in enumerate(sites, 1)]
+        lines.extend((atom_line(12, "CA", "CA", "A", 12, (48, 0, 0), "C", het=True),
+                      atom_line(13, "O", "CA", "A", 12, (49, 0, 0), "O", het=True)))
+        self.input.write_text("\n".join([*lines, "END"]) + "\n", encoding="ascii")
+        self.assertEqual([atom.pdb.element.name for atom in Structure(self.input).atoms],
+                         [element for *_, element in sites] + ["C", "O"])
+
+    def test_cofactor_and_same_number_water_are_preserved_with_declared_metal_links(self):
+        self.fixture()
+        ring = self.input.read_text(encoding="ascii").splitlines()[:-1]
+        metal = atom_line(6, "MO", "PCD", "B", 10, radial("NE2", 3.23), "MO", het=True)
+        ligand = atom_line(7, "O1", "PCD", "B", 10, radial("NE2", 5.10), "O", het=True)
+        water = atom_line(8, "O", "HOH", "B", 10, radial("ND1", 4.20), "O", het=True)
+        for declared in (False, True):
+            with self.subTest(declared=declared):
+                connections = ["CONECT    6    7"] + (["CONECT    4    6"] if declared else [])
+                self.input.write_text("\n".join([*ring, metal, ligand, water, *connections, "END"]) + "\n", encoding="ascii")
+                data, folder = self.run_cli(name=f"cofactor-{declared}")
+                self.assertEqual(data["recommendation"], "HID" if declared else None)
+                contact, = data["metal_contacts"]
+                self.assertEqual((contact["element"], contact["nitrogen"], contact["confirmed"]), ("MO", "NE2", declared))
+                local = Structure(folder / data["exports"][0]["pdb"])
+                self.assertEqual([residue.name for residue in local.residues_by_name.values() if residue.id.chain == "B"],
+                                 ["PCD", "HOH"])
+                molybdenum = next(atom for atom in local.atoms if atom.element == "MO")
+                self.assertIn("O1", {atom.name for atom in local.declared_partners[molybdenum]})
+
+    def test_progress_uses_completed_sites_and_leaves_normal_stdout_unchanged(self):
+        self.fixture()
+        for progress in (False, True):
+            options = [str(self.input), "-o", str(self.root / str(progress))]
+            with redirect_stdout(io.StringIO()) as stdout:
+                self.assertEqual(main(options + (["--progress-json"] if progress else [])), 0)
+            events = [json.loads(line[len(PROGRESS_PREFIX):]) for line in stdout.getvalue().splitlines()
+                      if line.startswith(PROGRESS_PREFIX)]
+            states = [(event["phase"], event["completed"], event["total"]) for event in events]
+            self.assertEqual(states, [("reading", 0, 0), ("sites", 0, 1), ("sites", 1, 1), ("saving", 0, 0)]
+                             if progress else [])
 
     def test_contact_limits_change_evidence_and_flag_controls_pngs(self):
         self.fixture([("ND1", "acceptor"), ("NE2", "sulfur")])

@@ -1,6 +1,7 @@
 """Desktop front end for the hischeck command-line program."""
 
 import argparse
+from collections import Counter, deque
 import csv
 import json
 from math import isfinite
@@ -9,8 +10,9 @@ from pathlib import Path
 import re
 import subprocess
 import sys
+from tempfile import TemporaryDirectory, TemporaryFile
 
-from PySide6.QtCore import QEvent, QPoint, QSettings, QSignalBlocker, QStandardPaths, QThread, QTimer, Qt, QUrl
+from PySide6.QtCore import QEvent, QPoint, QSettings, QSignalBlocker, QStandardPaths, QThread, QTimer, Qt, QUrl, Signal
 from PySide6.QtGui import QBrush, QColor, QDesktopServices, QDragEnterEvent, QDropEvent, QFont, QIcon
 from PySide6.QtWidgets import (
     QApplication, QCheckBox, QComboBox, QDialog, QFileDialog, QFormLayout, QGridLayout, QHBoxLayout, QHeaderView,
@@ -18,7 +20,8 @@ from PySide6.QtWidgets import (
     QVBoxLayout, QWidget,
 )
 
-from .__main__ import DEFAULT_OUTPUT_RADIUS, DEFAULTS, METAL_SEARCH
+from . import __version__
+from .__main__ import DEFAULT_OUTPUT_RADIUS, DEFAULTS, METAL_SEARCH, PROGRESS_PREFIX, write_json
 from .i18n import LANGUAGE_ENV, current_language, language_directory, languages, set_language, tr
 from .pymol import find_pymol, launch_pymol, pymol_path
 from .review import (
@@ -27,7 +30,9 @@ from .review import (
 )
 from .structure import RESIDUE_TYPES, residue_type
 from .table_filters import FilterHeader
+from .updates import UpdateCheck
 from .view3d import StructureView
+from .view_export import PreviewExporter, PreviewJob
 
 PROJECT = Path(__file__).resolve().parents[1]
 FROZEN = getattr(sys, "frozen", False)
@@ -35,7 +40,7 @@ PYMOL_KEY = "pymol/executable"
 RESIDUES_KEY = "processing/residues"
 LANGUAGE_KEY = "interface/language"
 PROPKA_KEY = "processing/propka"
-RUN_NOTICE_KEY = "interface/hide_run_notice"
+EXPORT_PREVIEWS_KEY = "processing/exportPreviews"
 APP_ICON = Path(__file__).with_name("assets") / "app.ico"
 PDB_SUFFIXES = {".pdb", ".ent"}
 STATUS_COLOR = {"recommended": "#157362", "review": "#965e26", "unresolved": "#9c435b", "checked": "#157362"}
@@ -51,7 +56,14 @@ HischeckApp, QDialog { background: #f7f9fb; }
 QLabel { color: #1d384c; }
 QLabel#muted { color: #53697a; }
 QLineEdit, QComboBox { background: white; color: #19374a; border: 1px solid #d1dde6; border-radius: 5px; padding: 5px 7px; }
-QLineEdit:focus, QComboBox:focus { border-color: #417a90; }
+QLineEdit:focus, QComboBox:focus, QComboBox:on { border-color: #417a90; }
+QComboBox { padding-right: 30px; combobox-popup: 0; }
+QComboBox:hover { background: #f7fafc; border-color: #a5bfcf; }
+QComboBox:disabled { background: #f3f6f8; color: #8093a2; }
+QComboBox::drop-down { subcontrol-origin: border; subcontrol-position: top right; width: 27px; border: 0; }
+QComboBox::down-arrow { image: url("COMBO_ARROW"); width: 12px; height: 8px; }
+QComboBox QAbstractItemView { background: white; color: #19374a; border: 1px solid #a5bfcf; padding: 3px; outline: 0; selection-background-color: #dcedf4; selection-color: #194357; }
+QComboBox QAbstractItemView::item { padding: 4px 7px; }
 QLineEdit:read-only { background: #fbfcfd; }
 QPushButton { background: white; color: #22455a; border: 1px solid #cad8e3; border-radius: 5px; padding: 5px 11px; }
 QPushButton:hover { background: #eaf2f7; }
@@ -70,11 +82,13 @@ QToolButton#column-filter:hover, QToolButton#column-filter:focus { border-color:
 QToolButton#column-filter[filtered="true"] { color: white; background: #17677b; border-color: #17677b; }
 QToolButton#column-filter:disabled { color: #8b9daa; }
 QSplitter::handle { background: #e7eff4; }
-"""
+""".replace("COMBO_ARROW", APP_ICON.with_name("combo-arrow.png").as_posix())
 
 
 class AnalysisProcess(QThread):
     """Run the CLI off the GUI thread and capture its exit status and diagnostic output."""
+
+    progress_changed = Signal(str, int, int)
 
     def __init__(self, command: list[str], parent: QWidget):
         super().__init__(parent)
@@ -83,18 +97,29 @@ class AnalysisProcess(QThread):
 
     def run(self):
         try:
-            result = subprocess.run(
+            # Spool diagnostics independently so a full stderr pipe cannot block stdout progress.
+            with TemporaryFile() as diagnostics, subprocess.Popen(
                 self.command,
                 cwd=Path(sys.executable).parent if FROZEN else PROJECT,
                 env={**os.environ, LANGUAGE_ENV: current_language()},
                 stdin=subprocess.DEVNULL,
-                capture_output=True,
+                stdout=subprocess.PIPE,
+                stderr=diagnostics,
                 encoding="utf-8",
                 errors="replace",
                 creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-            )
-            if result.returncode:
-                self.error = (result.stderr or result.stdout).strip()[-2500:] or tr("gui.worker_exit", code=result.returncode)
+            ) as child:
+                output = deque(maxlen=10)
+                for line in child.stdout:
+                    if line.startswith(PROGRESS_PREFIX):
+                        event = json.loads(line[len(PROGRESS_PREFIX):])
+                        self.progress_changed.emit(event["phase"], event["completed"], event["total"])
+                    else:
+                        output.append(line)
+                if returncode := child.wait():
+                    diagnostics.seek(max(0, diagnostics.tell() - 8192))
+                    detail = diagnostics.read().decode("utf-8", errors="replace") or "".join(output)
+                    self.error = detail.strip()[-2500:] or tr("gui.worker_exit", code=returncode)
         except (OSError, ValueError) as error:
             self.error = str(error)
 
@@ -140,18 +165,29 @@ class HischeckApp(QWidget):
         self.suggested_output: Path | None = None
         self.destination: Path | None = None
         self.process: AnalysisProcess | None = None
+        self.preview_exporter = PreviewExporter(self)
+        self.preview_exporter.saved.connect(self._preview_saved)
+        self.preview_exporter.finished.connect(self._previews_finished)
+        self.batch_previews: dict[Path, PreviewJob] = {}
+        self.preview_counts: Counter | None = None
+        self.preview_total = 0
         self.preferences = QSettings("HisCheck", "HisCheck")
         self._translations = []
         self._result_message = ("gui.start", None, {})
+        self.running_phase = "reading"
         self._site_error = None
         self._variant_error = None
         self.with_propka = self.preferences.value(PROPKA_KEY, True, type=bool)
+        self.export_previews = self.preferences.value(EXPORT_PREVIEWS_KEY, True, type=bool)
         saved_types = self.preferences.value(RESIDUES_KEY, "", type=str).split(",")
         self.target_types = set(RESIDUE_TYPES).intersection(saved_types) or set(RESIDUE_TYPES)
+        self.updates = UpdateCheck(self)
         documents = QStandardPaths.writableLocation(QStandardPaths.StandardLocation.DocumentsLocation)
         self.default_results = (Path(documents or Path.home()) / "HisCheck") if FROZEN else PROJECT / "results"
         self._build()
         self.clear_site()
+        self.updates.changed.connect(self.refresh_update_button)
+        QTimer.singleShot(0, self.updates.check)
 
     def bind_text(self, setter, key: str):
         setter(tr(key))
@@ -176,6 +212,9 @@ class HischeckApp(QWidget):
         title.setFont(QFont(self.font().family(), 20, QFont.Weight.DemiBold))
         header.addWidget(title)
         header.addStretch()
+        self.update_button = self.text_button("update.download", self.open_release_page)
+        self.update_button.hide()
+        header.addWidget(self.update_button)
         self.open_button = self.text_button("gui.open_results", self.browse_results)
         self.settings_button = self.text_button("gui.settings", self.open_settings)
         header.addWidget(self.open_button)
@@ -201,10 +240,12 @@ class HischeckApp(QWidget):
         body.addLayout(files)
         actions = QHBoxLayout()
         self.run_button = self.text_button("gui.run", self.run, objectName="run")
+        self.bind_text(self.run_button.setToolTip, "notice.body")
         self.result_message = QLabel(tr("gui.start"), objectName="muted")
         self.progress = QProgressBar()
         self.progress.setRange(0, 0)
-        self.progress.setFixedWidth(110)
+        self.progress.setFixedWidth(165)
+        self.progress.setFormat("%v / %m")
         self.progress.hide()
         actions.addWidget(self.run_button)
         actions.addWidget(self.result_message, 1)
@@ -354,6 +395,16 @@ class HischeckApp(QWidget):
         if selected:
             self.suggest_output(Path(selected))
 
+    def refresh_update_button(self):
+        available = not self.updates.release_page.isEmpty()
+        self.update_button.setVisible(available)
+        self.update_button.setToolTip(tr("update.available", version=self.updates.latest) if available else "")
+
+    def open_release_page(self):
+        if not self.updates.release_page.isEmpty() and not QDesktopServices.openUrl(self.updates.release_page):
+            QMessageBox.warning(self, tr("update.download"),
+                                tr("update.open_failed", url=self.updates.release_page.toString()))
+
     def open_settings(self):
         dialog = QDialog(self)
         dialog.setWindowTitle(tr("gui.settings"))
@@ -377,6 +428,14 @@ class HischeckApp(QWidget):
         form.addRow(tr("settings.language"), language_row)
         propka_check = QCheckBox(tr("settings.propka"), checked=self.with_propka)
         form.addRow("PROPKA", propka_check)
+        preview_check = QCheckBox(tr("settings.export_previews"), checked=self.export_previews)
+        preview_hint = QLabel(tr("settings.export_previews_hint"), objectName="muted", wordWrap=True)
+        preview_check.setToolTip(preview_hint.text())
+        preview_controls = QVBoxLayout()
+        preview_controls.setSpacing(3)
+        preview_controls.addWidget(preview_check)
+        preview_controls.addWidget(preview_hint)
+        form.addRow(tr("settings.images"), preview_controls)
         options = [(key, tr(title)) for key, title, _ in DISTANCE_OPTIONS]
         distance_keys = {key for key, _ in options}
         options += [("chain", tr("settings.chains")), ("model", tr("settings.model")), ("ph", tr("settings.ph")),
@@ -441,6 +500,8 @@ class HischeckApp(QWidget):
             self.preferences.setValue(RESIDUES_KEY, ",".join(chosen))
             self.with_propka = propka_check.isChecked()
             self.preferences.setValue(PROPKA_KEY, self.with_propka)
+            self.export_previews = preview_check.isChecked()
+            self.preferences.setValue(EXPORT_PREVIEWS_KEY, self.export_previews)
             self.preferences.setValue(LANGUAGE_KEY, language.currentData())
             self.preferences.sync()
             dialog.accept()
@@ -451,6 +512,19 @@ class HischeckApp(QWidget):
         pymol_row.addWidget(QPushButton(tr("common.browse"), clicked=browse_pymol))
         pymol_row.addWidget(QPushButton(tr("settings.auto_find"), clicked=use_auto_pymol))
         form.addRow(tr("settings.pymol_path"), pymol_row)
+        update_row = QHBoxLayout()
+        update_check = QPushButton(tr("update.check"), clicked=self.updates.check)
+        update_status = QLabel(objectName="muted", wordWrap=True)
+        update_row.addWidget(update_check)
+        update_row.addWidget(update_status, 1)
+        form.addRow(tr("update.installed", version=__version__), update_row)
+
+        def show_update_status():
+            update_check.setEnabled(self.updates.status != "checking")
+            update_status.setText(tr(f"update.{self.updates.status}", version=self.updates.latest))
+
+        show_update_status()
+        self.updates.changed.connect(show_update_status)
         layout.addLayout(form)
         advanced_toggle = QPushButton(checkable=True, objectName="advanced-settings")
 
@@ -471,7 +545,11 @@ class HischeckApp(QWidget):
         buttons.addWidget(QPushButton(tr("common.cancel"), clicked=dialog.reject))
         buttons.addWidget(QPushButton(tr("common.apply"), clicked=apply_settings))
         layout.addLayout(buttons)
-        if dialog.exec() == QDialog.DialogCode.Accepted:
+        try:
+            accepted = dialog.exec() == QDialog.DialogCode.Accepted
+        finally:
+            self.updates.changed.disconnect(show_update_status)
+        if accepted:
             self.settings.update({key: edit.text().strip() for key, edit in edits.items()})
             for key, _, default in DISTANCE_OPTIONS:
                 self.settings[key] = self.settings[key] or f"{default:g}"
@@ -484,6 +562,7 @@ class HischeckApp(QWidget):
         QApplication.setApplicationDisplayName(tr("gui.title"))
         for setter, key in self._translations:
             setter(tr(key))
+        self.refresh_update_button()
         columns = (*result_columns(), tr("column.pka"))
         self.table.setHorizontalHeaderLabels(columns)
         self.filter_header.labels = columns
@@ -509,6 +588,9 @@ class HischeckApp(QWidget):
         self.refresh_result_message()
 
     def refresh_result_message(self):
+        if self.destination is not None:
+            self.result_message.setText(tr(f"progress.{self.running_phase}"))
+            return
         key, suffix, values = self._result_message
         if key == "gui.confirmed":
             values = {**values, "state": state_text(values["state"])}
@@ -560,7 +642,7 @@ class HischeckApp(QWidget):
             if interpreter.name.lower() == "pythonw.exe":
                 interpreter = interpreter.with_name("python.exe")
             command = [str(interpreter), "-X", "utf8", "-m", "hischeck"]
-        command.extend([str(source), "-o", str(destination), "--render", "--all-states"])
+        command.extend([str(source), "-o", str(destination), "--progress-json", "--all-states"])
         if self.with_propka:
             command.append("--propka")
         for kind in RESIDUE_TYPES:
@@ -575,26 +657,9 @@ class HischeckApp(QWidget):
                 command.extend([f"--{key}", value])
         return command
 
-    def show_run_notice(self) -> bool:
-        if self.preferences.value(RUN_NOTICE_KEY, False, type=bool):
-            return True
-        notice = QMessageBox(QMessageBox.Icon.Information, tr("notice.title"), tr("notice.body"), parent=self)
-        notice.setTextFormat(Qt.TextFormat.PlainText)
-        skip = QCheckBox(tr("notice.dont_show"))
-        notice.setCheckBox(skip)
-        proceed = notice.addButton(tr("gui.run"), QMessageBox.ButtonRole.AcceptRole)
-        cancel = notice.addButton(tr("common.cancel"), QMessageBox.ButtonRole.RejectRole)
-        notice.setDefaultButton(proceed)
-        notice.setEscapeButton(cancel)
-        notice.exec()
-        if notice.clickedButton() is not proceed:
-            return False
-        if skip.isChecked():
-            self.preferences.setValue(RUN_NOTICE_KEY, True)
-            self.preferences.sync()
-        return True
-
     def run(self):
+        if self.destination is not None:
+            return
         source = Path(self.input_path.text().strip()).expanduser()
         if not source.is_file():
             QMessageBox.warning(self, tr("gui.pdb_required"), tr("gui.pdb_required_detail"))
@@ -608,14 +673,13 @@ class HischeckApp(QWidget):
         if destination.exists():
             QMessageBox.warning(self, tr("gui.output_exists"), tr("gui.output_exists_detail"))
             return
-        if not self.show_run_notice():
-            return
         self.destination = destination
         self.output_path.setText(str(destination))
-        self.set_result_message("gui.running")
+        self._run_progress("reading", 0, 0)
         self._busy(True)
         process = AnalysisProcess(self.build_command(source.resolve(), destination), self)
         self.process = process
+        process.progress_changed.connect(self._run_progress)
         process.finished.connect(self._run_finished)
         process.start()
 
@@ -624,16 +688,87 @@ class HischeckApp(QWidget):
             control.setEnabled(not running)
         self.progress.setVisible(running)
 
+    def _run_progress(self, phase: str, completed: int, total: int):
+        self.progress.setRange(0, total)
+        self.progress.setValue(completed)
+        if phase != self.running_phase or completed == 0:
+            self.running_phase = phase
+            self.refresh_result_message()
+
     def _run_finished(self):
         process, self.process = self.process, None
-        destination, self.destination = self.destination, None
         process.deleteLater()
-        self._busy(False)
         if process.error is not None:
+            self.destination = None
+            self._busy(False)
             self.set_result_message("gui.run_failed_hint")
             QMessageBox.warning(self, tr("gui.run_failed"), process.error)
-        elif destination is not None:
-            self.load_results(destination)
+            return
+        if not self.export_previews:
+            self._finish_run()
+            return
+        try:
+            destination = self.destination
+            with (destination / "summary.csv").open(encoding="utf-8-sig", newline="") as file:
+                folders = [destination / row["directory"] for row in csv.DictReader(file)]
+            jobs = []
+            for folder in folders:
+                evidence = json.loads((folder / "evidence.json").read_text(encoding="utf-8"))
+                for export in evidence["exports"]:
+                    pdb = folder / export["pdb"]
+                    jobs.append(PreviewJob(pdb, pdb.with_suffix(".png"), evidence, export["state"]))
+        except (OSError, KeyError, ValueError) as error:
+            self._finish_run()
+            QMessageBox.warning(self, tr("gui.read_failed"), str(error))
+            return
+        if jobs:
+            self.batch_previews = {job.png: job for job in jobs}
+            self.preview_counts = Counter()
+            self.preview_total = len(jobs)
+            self._run_progress("images", 0, self.preview_total)
+            self.preview_exporter.enqueue(jobs)
+        else:
+            self._finish_run()
+
+    def _preview_saved(self, job: PreviewJob, kind: str):
+        if job.png in self.batch_previews:
+            self.preview_counts[kind or "failed"] += 1
+            if kind:
+                export = next(item for item in job.evidence["exports"] if item["pdb"] == job.pdb.name)
+                export["image"] = job.png.name
+                export["image_format"] = kind
+            self._run_progress("images", self.preview_counts.total(), self.preview_total)
+        elif job.pdb == self.current_pdb:
+            self.show_variant_details()
+
+    def _previews_finished(self):
+        if self.preview_counts is None:
+            return
+        metadata = {job.png.parent: job.evidence for job in self.batch_previews.values()}
+        counts, self.preview_counts = self.preview_counts, None
+        self.batch_previews.clear()
+        self._run_progress("saving", 0, 0)
+        try:
+            with TemporaryDirectory(prefix=".hischeck-images-", dir=self.destination) as temp:
+                staged = Path(temp) / "metadata.json"
+                for folder, evidence in metadata.items():
+                    write_json(staged, evidence)
+                    staged.replace(folder / "evidence.json")
+                manifest = self.destination / "run.json"
+                run = json.loads(manifest.read_text(encoding="utf-8"))
+                run.update(render_previews=bool(counts["3d"] or counts["2d"]), preview_formats=dict(counts))
+                write_json(staged, run)
+                staged.replace(manifest)
+        except (OSError, ValueError) as error:
+            self._finish_run()
+            QMessageBox.warning(self, tr("gui.read_failed"), str(error))
+        else:
+            self._finish_run()
+
+    def _finish_run(self):
+        destination, self.destination = self.destination, None
+        self._busy(False)
+        self.load_results(destination)
 
     def browse_results(self):
         start = self.result_root or (self.default_results if FROZEN else PROJECT / "validation")
@@ -668,9 +803,15 @@ class HischeckApp(QWidget):
         try:
             metadata = json.loads((directory / "run.json").read_text(encoding="utf-8"))
             propka_status = metadata.get("propka", {}).get("status")
+            preview_formats = metadata.get("preview_formats", {})
         except (OSError, ValueError, AttributeError):
             propka_status = None
+            preview_formats = {}
         suffix = f"gui.propka_{propka_status}" if propka_status in {"unavailable", "failed"} else None
+        if not suffix and preview_formats.get("failed"):
+            suffix = "gui.preview_failed"
+        if not suffix and preview_formats.get("2d"):
+            suffix = "gui.preview_fallback"
         self.set_result_message(message_key, suffix=suffix, directory=directory.name)
         self.root_folder.setEnabled(True)
         self.export_button.setEnabled(bool(rows))
@@ -944,6 +1085,8 @@ class HischeckApp(QWidget):
         self.confirm_button.setEnabled(state is not None)
         self.show_variant_details()
         self.viewer.load(pdb, png, self.evidence, state)
+        if self.export_previews and self.destination is None and not png.is_file():
+            self.preview_exporter.enqueue([PreviewJob(pdb, png, self.evidence, state)])
 
     def show_variant_details(self):
         if self._variant_error is not None:

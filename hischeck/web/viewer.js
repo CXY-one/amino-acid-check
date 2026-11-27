@@ -89,11 +89,14 @@ window.hisViewer = (() => {
         render();
     }
 
-    function initialize(locale) {
+    function initialize(locale, exporting = false) {
         if (locale) setLocale(locale);
         if (viewer) return "";
         try {
-            viewer = $3Dmol.createViewer(panel, { backgroundColor: "#f2f6f9", antialias: true });
+            // An offscreen Qt page has no viewport until the canvas has explicit dimensions.
+            if (exporting) Object.assign(panel.style, { width: "1200px", height: "800px" });
+            viewer = $3Dmol.createViewer(panel, { backgroundColor: "#f2f6f9", antialias: true,
+                preserveDrawingBuffer: exporting, upscale: !exporting });
             viewer.setProjection("orthographic");
             viewer.render();
             caption.hidden = true;
@@ -203,12 +206,20 @@ window.hisViewer = (() => {
                 model.setStyle({ serial }, { sphere: { radius: 0.26, color: elements[atom.elem] || "#50778b" } }, true);
             }
         }
+        if (evidence.checked && neighbors.checked) {
+            for (const serial of new Set(structure.coordination.map(link => link.to))) {
+                const atom = atomBySerial.get(serial);
+                if (atom && !structure.target.includes(serial) && !evidenceAtoms.includes(serial)) {
+                    model.setStyle({ serial }, { sphere: { radius: 0.19, color: neighborElements[atom.elem] || "#50778b" } }, true);
+                }
+            }
+        }
         for (const serial of metals) {
             const atom = atomBySerial.get(serial);
             if (!atom || !(neighbors.checked || evidenceAtoms.includes(serial) ||
                 (nearby.checked && structure.nearbyAtoms.includes(serial)))) continue;
             model.setStyle({ serial }, { sphere: { radius: 0.42, color: "#8660a2" } });
-            addLabel(structure.metals[serial], atom, "#693b80", { alignment: "center", screenOffset: { x: 0, y: -18 } });
+            addLabel(structure.metals[serial], atom, "#693b80", { alignment: "center", screenOffset: { x: 0, y: -26 } });
         }
         if (nearby.checked) {
             for (const serial of structure.nearbyAtoms) {
@@ -274,7 +285,7 @@ window.hisViewer = (() => {
         }
     }
 
-    function load(scene) {
+    function load(scene, interactive = true) {
         const error = initialize();
         if (error) return error;
         try {
@@ -289,7 +300,13 @@ window.hisViewer = (() => {
             atomBySerial = new Map(atoms.map(atom => [atom.serial, atom]));
             atomByKey = new Map(atoms.map(atom => [atomKey(atom), atom]));
             if (scene.target.some(serial => !atomBySerial.has(serial))) throw new Error(tr("missing_target"));
-            const metalIndices = new Set(atoms.filter(atom => Object.hasOwn(scene.metals, atom.serial)).map(atom => atom.index));
+            const metalIndices = new Set();
+            for (const atom of atoms) {
+                if (Object.hasOwn(scene.metals, atom.serial)) {
+                    atom.elem = scene.metals[atom.serial];
+                    metalIndices.add(atom.index);
+                }
+            }
             for (const atom of atoms) {
                 for (let i = atom.bonds.length - 1; i >= 0; i--) {
                     if (metalIndices.has(atom.index) || metalIndices.has(atom.bonds[i])) {
@@ -313,8 +330,8 @@ window.hisViewer = (() => {
             model.setClickable({}, true, pickAtom);
             setMeasuring(wasMeasuring);
             render();
-            homeView = defaultView || viewAroundTarget();
-            if (previous) viewer.setView(previous);
+            if (interactive) homeView = defaultView || viewAroundTarget();
+            if (previous && interactive) viewer.setView(previous);
             focus.disabled = neighbors.disabled = nearby.disabled = measure.disabled = false;
             evidence.disabled = scene.links.length === 0 && scene.coordination.length === 0;
             empty.hidden = true;
@@ -324,6 +341,16 @@ window.hisViewer = (() => {
             clear();
             return tr("scene_error", { error: error.message || error });
         }
+    }
+
+    function snapshot(scene) {
+        const error = load(scene, false);
+        if (error) return { error };
+        const { axes, center, serials } = scene.snapshotView;
+        viewer.zoomTo({ serial: serials });
+        viewer.setView([...center.map(value => -value), viewer.getView()[3], ...orientation(axes)]);
+        viewer.zoom(0.80);
+        return { png: viewer.pngURI() };
     }
 
     focus.addEventListener("click", () => { if (homeView) viewer.setView(homeView); });
@@ -339,5 +366,5 @@ window.hisViewer = (() => {
         setMeasuring(measuring);
         render();
     });
-    return { initialize, setLocale, clear, load };
+    return { initialize, setLocale, clear, load, snapshot };
 })();

@@ -65,7 +65,7 @@ def display_bonds(structure: Structure, pdb_text: str) -> list[tuple[int, int, f
     for pair in peptide_links(pdb_text):
         if all(serial in serials for serial in pair):
             bonds.setdefault(pair, 1)
-    for residue in structure.residues.values():
+    for residue in structure.residues_by_name.values():
         if residue.name not in PROTEIN:
             continue
         for first, second, order in residue_orders(residue):

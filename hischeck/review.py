@@ -77,7 +77,7 @@ def ensure_variant(folder: Path, evidence: dict, export: dict) -> Path:
         raise FileNotFoundError(tr("review.no_source_pdb"))
     source = Structure(base)
     target = source.residues[ResidueID(evidence["chain"], evidence["residue_number"], evidence["insertion_code"])]
-    neighbors = list(source.residues.values())
+    neighbors = list(source.residues_by_name.values())
     with TemporaryDirectory(prefix=".hischeck-", dir=folder) as temp:
         staged = Path(temp) / pdb.name
         if kind == "HIS":

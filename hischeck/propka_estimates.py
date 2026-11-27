@@ -18,7 +18,7 @@ def selected_pdb(source: Structure) -> str:
     for chain in model:
         for residue in chain:
             key = ResidueID(chain.name.strip(), residue.seqid.num, residue.seqid.icode.strip(" \0"))
-            selected = source.residues[key]
+            selected = source.residues_by_name[key, residue.name]
             for index in reversed(range(len(residue))):
                 atom = residue[index]
                 chosen = selected.atoms.get(atom.name)
