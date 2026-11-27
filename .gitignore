@@ -1,0 +1,36 @@
+# Python and local tools
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.env
+.env.*
+.idea/
+.vscode/
+
+# Build output and local research or review data
+/.package-stage/
+/build/
+/dist/
+/releases/
+/results/
+/validation/
+/handoff/
+/.pi/
+*_HisCheck*/
+*.pdb
+*.ent
+*.xlsx
+*.sqlite*
+*.zip
+*.exe
+
+# Local credentials
+*api-token*
+*github-api*
+*.pem
+*.key
+Thumbs.db
+.DS_Store

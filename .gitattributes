@@ -1,0 +1,6 @@
+* text=auto
+*.cmd text eol=crlf
+*.vbs text eol=crlf
+*.ico binary
+*.png binary
+hischeck/web/vendor/* -text

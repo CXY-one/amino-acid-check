@@ -1,0 +1,55 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title data-text="title"></title>
+  <style>
+    :root { color-scheme: light; font: 13px 'Microsoft YaHei UI', 'Segoe UI', sans-serif; color: #213b4d; }
+    body { margin: 0; overflow: hidden; background: #f2f6f9; }
+    #scene { position: absolute; inset: 0; }
+    #scene.measuring canvas { cursor: crosshair; }
+    #toolbar, #legend, #caption { position: absolute; z-index: 1; }
+    #toolbar { top: 12px; left: 12px; right: 12px; display: flex; flex-wrap: wrap; align-items: center; gap: 7px; pointer-events: none; }
+    #toolbar > * { pointer-events: auto; }
+    button, .switches { background: #fff; border: 1px solid #cddce5; border-radius: 6px; color: inherit; }
+    button { padding: 5px 10px; cursor: pointer; font: inherit; }
+    button:hover { background: #eaf1f6; }
+    button[aria-pressed="true"] { background: #176777; color: #fff; border-color: #176777; }
+    button:disabled { cursor: default; opacity: 0.55; }
+    .measure-tools { display: flex; gap: 5px; }
+    .switches { display: flex; gap: 8px; padding: 5px 9px; }
+    label { display: inline-flex; align-items: center; gap: 4px; white-space: nowrap; }
+    input { margin: 0; accent-color: #176777; }
+    #caption { bottom: 12px; left: 12px; max-width: calc(100% - 40px); color: #486275; background: #fffffff2; padding: 5px 8px; border-radius: 4px; pointer-events: none; }
+    #legend { top: 49px; right: 12px; display: flex; gap: 10px; background: #fffffff2; padding: 5px 8px; border-radius: 4px; pointer-events: none; }
+    #legend:empty { display: none; }
+    #legend span { display: flex; align-items: center; gap: 4px; white-space: nowrap; }
+    .line { width: 12px; border-top: 2px dashed; }
+    #empty { position: absolute; inset: 0; display: grid; place-items: center; color: #5b7282; pointer-events: none; }
+    #empty[hidden] { display: none; }
+    @media (min-width: 910px) { #legend { top: 13px; } }
+    @media (max-width: 505px) { #legend { top: 82px; } }
+  </style>
+  <script defer src="vendor/3Dmol-min.js"></script>
+  <script defer src="viewer.js"></script>
+</head>
+<body>
+  <div id="scene" data-aria="aria"></div>
+  <div id="empty" data-text="empty"></div>
+  <div id="toolbar">
+    <button id="focus" type="button" disabled data-text="focus"></button>
+    <div class="switches">
+      <label><input id="neighbors" type="checkbox" checked disabled><span data-text="neighbors"></span></label>
+      <label data-tip="evidence_tip"><input id="evidence" type="checkbox" checked disabled><span data-text="evidence"></span></label>
+      <label data-tip="nearby_tip"><input id="nearby" type="checkbox" disabled><span data-text="nearby"></span></label>
+    </div>
+    <div class="measure-tools">
+      <button id="measure" type="button" aria-pressed="false" data-tip="measure_tip" disabled data-text="measure"></button>
+      <button id="clear-measurements" type="button" disabled data-text="clear"></button>
+    </div>
+  </div>
+  <div id="legend"></div>
+  <div id="caption"></div>
+</body>
+</html>

@@ -1,0 +1,18 @@
+Amino Acid Check portable distribution includes these unmodified third-party runtimes.
+
+Python 3.11.9 is distributed under the Python Software Foundation license.
+https://www.python.org/downloads/release/python-3119/
+
+PySide6 and Shiboken 6.12.0, Qt 6.12.0 and Qt WebEngine 6.140.0 are used under the LGPL, with third-party Chromium components under their own terms. The Qt libraries are separate DLLs in _internal/PySide6 and can be replaced by compatible builds. The corresponding source releases and the WebEngine third-party license list are available at the following locations.
+https://download.qt.io/archive/qt/6.12/6.12.0/submodules/
+https://download.qt.io/official_releases/QtForPython/pyside6/PySide6-6.12.0-src/
+https://download.qt.io/official_releases/qtwebengine/6.140/6.140.0/
+https://doc.qt.io/qt-6/qtwebengine-licensing.html
+
+NumPy 2.2.6, Gemmi 0.7.5, Pillow 12.3.0, openpyxl 3.1.5, et_xmlfile 2.0.0 and the PyInstaller 6.22.3 bootloader are distributed under their accompanying licenses.
+
+PROPKA 3.5.1 is used under the GNU LGPL v2.1. The source and license are available with the release.
+https://github.com/jensengroup/propka/releases/tag/v3.5.1
+
+3Dmol.js 3.0.0 is used under the BSD 3-Clause License.
+https://www.npmjs.com/package/3dmol/v/3.0.0
